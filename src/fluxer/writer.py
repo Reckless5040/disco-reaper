@@ -6,7 +6,13 @@ from urllib.parse import urlparse
 from typing import Optional, List, Dict, Any
 from fluxer import Bot, Webhook, Forbidden, File
 
+from src.fluxer._lib_patches import apply_fluxer_patches
+
 logger = logging.getLogger(__name__)
+
+# Fix fluxer.py's sticker methods (wrong base_url on self-hosted instances)
+# before any HTTPClient is created. See _lib_patches for details.
+apply_fluxer_patches()
 
 
 def _normalize_fluxer_api_url(api_url: Optional[str]) -> str:
