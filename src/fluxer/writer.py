@@ -1,16 +1,96 @@
 import asyncio
 import io
 import logging
+import re
+from urllib.parse import urlparse
 from typing import Optional, List, Dict, Any
 from fluxer import Bot, Webhook, Forbidden, File
 
 logger = logging.getLogger(__name__)
 
+
+def _normalize_fluxer_api_url(api_url: Optional[str]) -> str:
+    """Normalizes whatever the user pasted into a full `.../api/v1` API base.
+
+    A self-hosted Fluxer instance serves the API behind one hostname at
+    `https://<host>/api/v1` (Caddy strips `/api`, the API mounts routes under
+    `/v1`). Users typically only know their hostname, so accept a bare host, an
+    origin, or a full API base and fill in the rest. Returns "default" for empty
+    input or the official Fluxer host so the wrapper uses its built-in URL.
+    """
+    raw = (api_url or "").strip()
+    if not raw or raw.lower() == "default":
+        return "default"
+
+    # Allow bare hosts like "chat.example.com" by assuming https.
+    if not re.match(r"^https?://", raw, re.IGNORECASE):
+        raw = "https://" + raw
+
+    parsed = urlparse(raw)
+    host = parsed.netloc.lower()
+    if not host:
+        return "default"
+
+    # Official Fluxer → let the wrapper fall back to its own default URL.
+    if "fluxer.app" in host:
+        return "default"
+
+    origin = f"{parsed.scheme or 'https'}://{parsed.netloc}"
+    path = parsed.path.rstrip("/")
+
+    # Already a versioned API base (e.g. .../api/v1) → trust it.
+    if re.search(r"/v\d+$", path):
+        return f"{origin}{path}"
+    # An "/api" mount without a version → add the version.
+    if path.endswith("/api"):
+        return f"{origin}{path}/v1"
+    # Bare origin → add the full self-hosted API mount.
+    if path in ("", "/"):
+        return f"{origin}/api/v1"
+    # Some other path the user supplied verbatim → trust it but ensure /v1.
+    return f"{origin}{path}/v1"
+
+
+async def _discover_fluxer_config(api_url: str) -> Dict[str, Any]:
+    """Best-effort probe of a self-hosted instance's discovery endpoint.
+
+    Queries `<origin>/api/.well-known/fluxer` to confirm the host is a Fluxer
+    instance and to surface its advertised endpoints in the logs. Purely
+    informational — the gateway WS URL is resolved dynamically by the wrapper
+    and uploads go through the API base, so a failed probe is not fatal.
+    """
+    info: Dict[str, Any] = {}
+    if not api_url or api_url == "default" or "fluxer.app" in api_url:
+        return info
+
+    parsed = urlparse(api_url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    import aiohttp
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = origin + "/api/.well-known/fluxer"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    features = data.get("features", {}) or {}
+                    info["self_hosted"] = features.get("self_hosted")
+                    info["endpoints"] = data.get("endpoints", {}) or {}
+                    logger.info(
+                        f"Fluxer discovery OK at {origin}: self_hosted={info.get('self_hosted')}, "
+                        f"endpoints={list(info.get('endpoints', {}).keys())}"
+                    )
+                else:
+                    logger.debug(f"Fluxer discovery at {url} returned HTTP {resp.status}")
+    except Exception as e:
+        logger.debug(f"Fluxer discovery failed for {origin}: {e}")
+    return info
+
+
 class FluxerWriter:
     def __init__(self, token: str, community_id: str, api_url: str = "default"):
         self.token = token
         self.community_id = str(community_id)
-        self.api_url = api_url
+        self.api_url = _normalize_fluxer_api_url(api_url)
         self.bot: Optional[Bot] = None
         self._bot_task: Optional[asyncio.Task] = None
         self._ready_event = asyncio.Event()
@@ -21,11 +101,17 @@ class FluxerWriter:
     async def fetch_guilds(token: str, api_url: str = "default") -> list[tuple[str, str]]:
         """Fetches the list of Fluxer communities the bot is in. Returns list of (label, id)."""
         from fluxer import HTTPClient, Guild
-        
+
+        api_url = _normalize_fluxer_api_url(api_url)
+
         http_kwargs = {}
         if api_url and api_url != "default":
             http_kwargs["api_url"] = api_url
-            
+            # Probe the self-hosted instance so the logs show whether the host
+            # is reachable and is actually a Fluxer instance.
+            await _discover_fluxer_config(api_url)
+            logger.info(f"Fluxer: Fetching communities using custom API URL: {api_url}")
+
         async with HTTPClient(token, **http_kwargs) as http:
             try:
                 guilds_data = await http.get_current_user_guilds()
@@ -65,10 +151,85 @@ class FluxerWriter:
             logger.error(f"Failed to manage webhook for channel {channel_id}: {e}")
             return None
 
+    # Embed sub-objects whose URLs the Fluxer server fetches/proxies server-side
+    # during webhook execution. A dead URL here makes the server hang then return
+    # 500, which fails (and drops) the whole message. Format: (section, url_field).
+    _EMBED_MEDIA_PATHS = (
+        ("thumbnail", "url"),
+        ("image", "url"),
+        ("video", "url"),
+        ("footer", "icon_url"),
+        ("author", "icon_url"),
+    )
+
+    async def _is_url_reachable(self, session, url: str) -> bool:
+        """Quick liveness probe with a short timeout.
+
+        Returns False only for the cases that make the server-side media proxy
+        hang or error: connection failures, timeouts, and 5xx. A fast 4xx still
+        counts as reachable (the proxy gets a prompt answer and won't stall).
+        """
+        import aiohttp
+        for method in ("head", "get"):
+            try:
+                async with getattr(session, method)(
+                    url,
+                    timeout=aiohttp.ClientTimeout(total=3),
+                    allow_redirects=True,
+                ) as resp:
+                    # Some hosts reject HEAD — retry once with GET before judging.
+                    if method == "head" and resp.status in (403, 405, 501):
+                        continue
+                    return resp.status < 500
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                return False
+        return False
+
+    async def _sanitize_embed_media(self, embeds: List[dict]) -> List[dict]:
+        """Strip embed media URLs that point at dead/unreachable hosts.
+
+        Probes every proxied media URL across the given embeds concurrently and
+        removes only the ones that fail, preserving live thumbnails/images. This
+        prevents a single dead embed URL from hanging the Fluxer server and
+        dropping the message (see _is_url_reachable)."""
+        if not embeds:
+            return embeds
+        import aiohttp
+
+        targets = []  # (embed_dict, section, field, url)
+        for emb in embeds:
+            for section, field in self._EMBED_MEDIA_PATHS:
+                sec = emb.get(section)
+                if isinstance(sec, dict):
+                    url = sec.get(field)
+                    if isinstance(url, str) and url.startswith(("http://", "https://")):
+                        targets.append((emb, section, field, url))
+
+        if not targets:
+            return embeds
+
+        async with aiohttp.ClientSession() as session:
+            results = await asyncio.gather(
+                *(self._is_url_reachable(session, t[3]) for t in targets),
+                return_exceptions=True,
+            )
+
+        for (emb, section, field, url), ok in zip(targets, results):
+            if ok is True:
+                continue  # reachable — leave it alone
+            sec = emb.get(section)
+            if isinstance(sec, dict):
+                sec.pop(field, None)
+                sec.pop("proxy_url", None)  # Discord mirrors the dead URL here too
+                if not sec:
+                    emb.pop(section, None)  # drop now-empty media container
+            logger.warning(
+                "Fluxer: stripped unreachable embed %s.%s (%s) before send",
+                section, field, url,
+            )
+        return embeds
+
     async def start(self):
-        # ... (lines 14-35)
-        # (I will use multi_replace or just replace_file_content carefully)
-        # Actually I'm using replace_file_content so I need to provide the whole block.
         if self.bot and self._bot_task and not self._bot_task.done():
             return
 
@@ -304,6 +465,11 @@ class FluxerWriter:
                 normalized_embeds.append(d)
         if not normalized_embeds: normalized_embeds = None
 
+        # Strip embed media URLs pointing at dead hosts — the server proxies these
+        # during webhook execution and a hung fetch causes a 500 that drops the message.
+        if normalized_embeds:
+            normalized_embeds = await self._sanitize_embed_media(normalized_embeds)
+
         try:
             # Current limitation: fluxer.py execute_webhook doesn't support 'message_reference' yet.
             # So if we have a reply, we MUST use the bot's direct send method.
@@ -324,8 +490,17 @@ class FluxerWriter:
                     logger.debug(f"Fluxer: Webhook send complete, msg_id={msg.id if msg else 'None'}")
                     return str(msg.id) if msg else None
                 except asyncio.TimeoutError:
-                    print(f"Fluxer: Webhook send timed out after 45s for channel {channel_id}")
-                    logger.error(f"Fluxer: Webhook send timed out after 45s for channel {channel_id}")
+                    file_info = (
+                        ", ".join(f"{f['filename']} ({len(f['data'])} bytes)" for f in files)
+                        if files else "none"
+                    )
+                    msg = (
+                        f"Fluxer: Webhook send timed out after 45s for channel {channel_id} "
+                        f"(author='{author_name}', files=[{file_info}]) — likely an oversized "
+                        f"attachment the server rejects/hangs on"
+                    )
+                    print(msg)
+                    logger.error(msg)
                     return None
             else:
                 # Use bot direct message (supports files and message_reference)
