@@ -21,6 +21,8 @@
 > - **Better diagnostics** — dropped messages, emoji/sticker/marker failures, and send timeouts now log the offending message, attachment sizes, and the server's per-field validation errors.
 >
 > These changes are aimed at being contributed upstream.
+>
+> **🤖 AI disclosure:** The changes in this fork were written with the assistance of an LLM (Anthropic's Claude, via Claude Code). They were diagnosed against real migration logs and verified locally, but review before relying on them for critical migrations.
 
 ---
 
