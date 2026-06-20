@@ -11,6 +11,18 @@
 
 ### Video Guide - [Youtube](https://www.youtube.com/watch?v=SwIPQDxLzqA)
 
+---
+
+> ### 🔱 Fork Notice
+> This is a fork of [`rambros3d/disco-reaper`](https://github.com/rambros3d/disco-reaper) with fixes for migrating to **self-hosted Fluxer instances**. Changes in this fork that are not (yet) in upstream:
+>
+> - **Self-hosted sticker sync/migration fix** — `fluxer.py`'s guild sticker HTTP methods send requests to the official host (`api.fluxer.app`) instead of the configured instance, causing `401 Unauthorized` on self-hosted servers. A runtime patch (`src/fluxer/_lib_patches.py`) reroutes them to the configured API URL.
+> - **Dead embed media handling** — embed thumbnail/image/icon URLs pointing at unreachable hosts made the server hang then return `500`, silently dropping the message. Each embed media URL is now probed (short concurrent timeout) and only unreachable ones are stripped before sending.
+> - **Better diagnostics** — dropped messages, emoji/sticker/marker failures, and send timeouts now log the offending message, attachment sizes, and the server's per-field validation errors.
+>
+> These changes are aimed at being contributed upstream.
+
+---
 
 | Features | Fluxer | Stoat |
 | :--- | :---: | :---: |
