@@ -578,8 +578,10 @@ class FluxerWriter:
             msg_data = await self.client.send_message(**kwargs)
             return str(msg_data["id"]) if msg_data else None
         except Exception as e:
-            print(f"Failed to send marker: {e}")
-            logger.error(f"Failed to send marker: {e}")
+            detail = getattr(e, "errors", None)
+            msg = f"Failed to send marker: {e}" + (f" — field errors: {detail}" if detail else "")
+            print(msg)
+            logger.error(msg)
             return None
 
     async def create_role(self, name: str, color: int, hoist: bool, mentionable: bool, permissions: int, position: Optional[int] = None) -> str:
@@ -619,7 +621,13 @@ class FluxerWriter:
             )
             return str(emoji["id"])
         except Exception as e:
-            logger.error(f"Failed to copy emoji '{name}': {e}", exc_info=True)
+            detail = getattr(e, "errors", None)
+            logger.error(
+                "Failed to copy emoji '%s' (name_len=%d, image=%d bytes): %s%s",
+                name, len(name), len(image_bytes), e,
+                f" — field errors: {detail}" if detail else "",
+                exc_info=True,
+            )
             return ""
 
     async def create_sticker(self, name: str, image_bytes: bytes) -> str:
@@ -636,7 +644,13 @@ class FluxerWriter:
             )
             return str(sticker["id"])
         except Exception as e:
-            logger.error(f"Failed to copy sticker '{name}': {e}", exc_info=True)
+            detail = getattr(e, "errors", None)
+            logger.error(
+                "Failed to copy sticker '%s' (name_len=%d, image=%d bytes): %s%s",
+                name, len(name), len(image_bytes), e,
+                f" — field errors: {detail}" if detail else "",
+                exc_info=True,
+            )
             return ""
 
     async def update_guild_metadata(self, name: Optional[str] = None, icon: Optional[bytes] = None, banner: Optional[bytes] = None) -> None:
